@@ -119,6 +119,7 @@
 #define IS_VM_STACK_SIZE_ARG(ARG) STARTS_WITH(ARG, VM_STACK_SIZE_ARG_PREFIX)
 #define IS_VM_ARG_FILE_ARG(ARG) STARTS_WITH(ARG, VM_ARG_FILE_ARG_PREFIX)
 #define IS_VM_START_ON_FIRST_THREAD(ARG) (ARG == "--vm.XstartOnFirstThread")
+#define IS_VM_MACOS_EVENT_LOOP_ON_FIRST_THREAD(ARG) (ARG == "--vm.XmacOSEventLoopOnFirstThread")
 
 #define NMT_ARG_NAME "XX:NativeMemoryTracking"
 #define NMT_ENV_NAME "NMT_LEVEL_"
@@ -384,6 +385,8 @@ static void parse_vm_option(
 #if defined (__APPLE__)
     } else if (IS_VM_START_ON_FIRST_THREAD(option)) {
         *startOnFirstThread = true;
+    } else if (IS_VM_MACOS_EVENT_LOOP_ON_FIRST_THREAD(option)) {
+        *startOnFirstThread = false;
 #endif
     } else if (IS_VM_ARG(option)) {
         if (IS_VM_STACK_SIZE_ARG(option)) {
@@ -872,7 +875,7 @@ int main(int argc, char *argv[]) {
 
 
     /* parse VM args */
-    struct MainThreadArgs parsedArgs{argc, argv, exeDir, jvmMode, libPath, 0, false};
+    struct MainThreadArgs parsedArgs{argc, argv, exeDir, jvmMode, libPath, 0, true};
     parse_vm_options(parsedArgs);
     size_t stack_size = parsedArgs.stack_size;
 
@@ -888,14 +891,18 @@ int main(int argc, char *argv[]) {
      * [2] https://github.com/openjdk/jdk/blob/8c1b915c7ef2b3a6e65705b91f4eb464caaec4e7/src/java.base/macosx/native/libjli/java_md_macosx.m#L292-L325
      */
     size_t main_thread_stack_size = current_thread_stack_size();
-    bool use_new_thread = stack_size > main_thread_stack_size;
+    bool want_bigger_stack = stack_size > main_thread_stack_size;
+    bool use_new_thread = want_bigger_stack;
 #if defined (__APPLE__)
     /* On macOS, default to creating a dedicated "main" thread for the JVM.
      * The actual main thread must run the UI event loop (needed for AWT).
      * It can be overridden with -XstartOnFirstThread, this is needed to
      * use other UI frameworks that *do* need to run on the main thread.
+     *
+     * If both a bigger stack size and -XstartOnFirstThread are given we use a new thread,
+     * because we want to respect the stack size over the default startOnFirstThread=true.
      */
-    use_new_thread = !parsedArgs.startOnFirstThread;
+    use_new_thread = want_bigger_stack || !parsedArgs.startOnFirstThread;
 
     if (jvmMode) {
         if (!load_jli_lib(exeDir)) {
