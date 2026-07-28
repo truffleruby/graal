@@ -38,10 +38,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
+import codecs
 import json
 import os
+import re
 import shutil
 import sys
+import threading
 from abc import ABCMeta, abstractmethod
 from os import listdir
 from os.path import join, exists, isfile, basename, relpath, isdir, isabs, dirname, normpath
@@ -397,6 +400,79 @@ class LanguageLibraryProject(NativeImageLibraryProject):
         return build_args
 
 
+class _NativeImageBuildOutput:
+    """
+    Adapts native-image's character-wise output to mx's interactive build status.
+
+    The current line is kept as the task's last log line so mx.showProgress() can redraw it in
+    place without adding permanent output to the terminal.
+    """
+
+    _ansi_escape_pattern = re.compile(r"\033\[[0-?]*[ -/]*[@-~]")
+
+    def __init__(self, task, read_fd):
+        self.task = task
+        self.read_fd = read_fd
+        self.current_line = ''
+        self.has_partial_line = False
+        self.pending_carriage_return = False
+        self.first_log_line = len(task._log.lines)
+        self.error = None
+
+    def _publish_partial_line(self):
+        if self.current_line or self.has_partial_line:
+            self.task.log(self.current_line, important=False, replace=self.has_partial_line)
+            self.has_partial_line = True
+
+    def _publish_completed_line(self):
+        self.task.log(
+            self.current_line,
+            important=False,
+            replace=self.has_partial_line,
+        )
+        self.current_line = ''
+        self.has_partial_line = False
+
+    def _consume(self, text):
+        for char in text:
+            if self.pending_carriage_return:
+                self.pending_carriage_return = False
+                if char == '\n':
+                    self._publish_completed_line()
+                    continue
+                # A standalone carriage return moves the cursor to the beginning of the line.
+                self.current_line = ''
+
+            if char == '\r':
+                self.pending_carriage_return = True
+            elif char == '\n':
+                self._publish_completed_line()
+            else:
+                self.current_line += char
+
+        if self.current_line and not self.pending_carriage_return:
+            self._publish_partial_line()
+
+    def run(self):
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        try:
+            with os.fdopen(self.read_fd, 'rb', buffering=0) as stream:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    self._consume(decoder.decode(chunk))
+                self._consume(decoder.decode(b'', final=True))
+                if self.current_line:
+                    self._publish_completed_line()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self.error = e
+
+    def strip_ansi_from_log(self):
+        for index in range(self.first_log_line, len(self.task._log.lines)):
+            self.task._log.lines[index] = self._ansi_escape_pattern.sub('', self.task._log.lines[index])
+
+
 class NativeImageBuildTask(mx.BuildTask):
     subject: NativeImageProject
     def __init__(self, args, project: NativeImageProject):
@@ -522,25 +598,59 @@ class NativeImageBuildTask(mx.BuildTask):
                 f.write(self._quote_argfile_arg(arg))
                 f.write('\n')
 
+    def _run_with_interactive_output(self, run_command):
+        read_fd, write_fd = os.pipe()
+        output = _NativeImageBuildOutput(self, read_fd)
+        reader = threading.Thread(
+            target=output.run,
+            name=f'native-image-output-{self.subject.output_file_name()}',
+        )
+        reader.start()
+        try:
+            mx.run(run_command, nonZeroIsFatal=True, out=write_fd, err=write_fd)
+        finally:
+            os.close(write_fd)
+            reader.join()
+            output.strip_ansi_from_log()
+
+        if output.error:
+            raise output.error
+
     def build(self):
         mx_util.ensure_dir_exists(self.subject.build_directory())
         native_image_command = self.get_build_command()
         run_command = native_image_command
+        if self.args.build_logs == 'interactive':
+            # native-image writes to a pipe in this mode, so explicitly enable color and progress;
+            # it would otherwise disable both. These options only affect presentation, so do not
+            # include them in native_image_command and its incremental-build check.
+            run_command = [
+                native_image_command[0],
+                '--color=always',
+            ] + mx_sdk_vm_impl.svm_experimental_options([
+                '-H:+BuildOutputProgress',
+            ]) + native_image_command[1:]
         if mx.is_windows():
             args_file = self._get_args_file()
-            self._write_args_file(args_file, native_image_command[1:])
-            run_command = [native_image_command[0], '@' + args_file]
+            self._write_args_file(args_file, run_command[1:])
+            run_command = [run_command[0], '@' + args_file]
 
-        # Prefix native-image builds that print straight to stdout or stderr with [<output_filename>:<pid>]
-        out = mx.PrefixCapture(lambda l: mx.log(l, end=''), self.subject.output_file_name())
-        err = mx.PrefixCapture(lambda l: mx.log(l, end='', file=sys.stderr), out.identifier)
-
-        mx.run(run_command, nonZeroIsFatal=True, out=out, err=err)
+        if self.args.build_logs == 'interactive':
+            self._run_with_interactive_output(run_command)
+        elif self.args.build_logs == 'full':
+            # Let native-image use the real terminal so its adaptive color, progress, and link
+            # handling works normally.
+            mx.run(run_command, nonZeroIsFatal=True, out=sys.stdout, err=sys.stderr)
+        else:
+            # Prefix native-image builds that print straight to stdout or stderr with
+            # [<output_filename>:<pid>].
+            out = mx.PrefixCapture(lambda l: mx.log(l, end=''), self.subject.output_file_name())
+            err = mx.PrefixCapture(lambda l: mx.log(l, end='', file=sys.stderr), out.identifier)
+            mx.run(run_command, nonZeroIsFatal=True, out=out, err=err)
 
         with open(self._get_command_file(), 'w', encoding='utf-8') as f:
             # Use '\n' and let text mode translate it to the platform-native line ending.
             f.writelines(l + '\n' for l in native_image_command)
-
 
     def _get_command_file(self):
         return self.subject.output_file() + '.cmd'
