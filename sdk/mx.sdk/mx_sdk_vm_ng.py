@@ -709,9 +709,11 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
         self.windows_manifest = join(_suite.dir, 'src', 'org.graalvm.launcher.native', 'manifest', 'launcher.manifest')
 
         if not kw_args.get('multitarget'):
-            # We use our LLVM toolchain on Linux by default because we want to statically link the C++ standard library,
-            # and the system toolchain rarely has libstdc++.a installed (it would be an extra CI & dev dependency).
-            toolchain = 'sdk:LLVM_NINJA_TOOLCHAIN' if mx.is_linux() else 'mx:DEFAULT_NINJA_TOOLCHAIN'
+            # We use the system toolchain and statically link the C++ standard library on Linux (see ldlibs),
+            # which requires libstdc++.a to be installed (e.g. the libstdc++-static package on Fedora/RHEL,
+            # it is part of libstdc++-N-dev on Debian/Ubuntu). This avoids downloading and extracting
+            # the much larger LLVM toolchain just to build the launcher.
+            toolchain = 'mx:DEFAULT_NINJA_TOOLCHAIN'
         else:
             toolchain = None
 
@@ -748,6 +750,10 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
     @property
     def uses_llvm_toolchain(self):
         return len(self.toolchains) == 1 and mx.dependency('LLVM_NINJA_TOOLCHAIN', fatalIfMissing=False) == self.toolchains[0].toolchain_dist
+
+    @property
+    def uses_default_toolchain(self):
+        return len(self.toolchains) == 1 and mx.dependency('mx:DEFAULT_NINJA_TOOLCHAIN') == self.toolchains[0].toolchain_dist
 
     @property
     def uses_musl_swcfi_toolchain(self):
@@ -896,6 +902,10 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
                 '-static-libstdc++', # it looks weird but this does link libc++ statically
                 '-l:libc++abi.a',
             ]
+        elif mx.is_linux() and self.uses_default_toolchain:
+            # Link libstdc++ statically, so the launcher does not depend on libstdc++.so being installed
+            # nor on its version. libgcc_s is linked statically too as libstdc++.a needs its unwinder.
+            _dynamic_ldlibs += ['-static-libstdc++', '-static-libgcc']
         if not mx.is_windows():
             _dynamic_ldlibs += ['-ldl']
         if mx.is_darwin():
