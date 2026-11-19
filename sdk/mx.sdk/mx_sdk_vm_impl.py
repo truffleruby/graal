@@ -74,6 +74,7 @@ import mx_jardistribution
 import mx_native
 import mx_subst
 import mx_sdk
+import mx_sdk_thin_launcher
 import mx_sdk_vm
 import mx_util
 
@@ -2431,75 +2432,42 @@ def _get_native_image_configs(component, config_type):
     return _native_image_configs.get(config_type).get(component.name, [])
 
 
-class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
+class NativeLibraryLauncherProject(mx_sdk_thin_launcher.RustLauncherProject):
     def __init__(self, component, language_library_config, **kwargs):
         """
         :type component: mx_sdk.GraalVmComponent
         :type language_library_config: mx_sdk_vm.LibraryConfig
         """
-        _dir = join(_suite.dir, "src", "org.graalvm.launcher.native")
         self.component = component
         self.language_library_config = language_library_config
         self.jvm_launcher = _skip_libraries(self.language_library_config) or not _get_svm_support().is_supported()
         _dependencies = [] if (self.jvm_launcher) else [GraalVmNativeImage.project_name(self.language_library_config)]
         self.jre_base = get_final_graalvm_distribution().path_substitutions.substitute('<jre_base>')
-        # We use our LLVM toolchain on Linux because we want to statically link the C++ standard library,
-        # and the system toolchain rarely has libstdc++.a installed (it would be an extra CI & dev dependency).
-        toolchain = 'sdk:LLVM_NINJA_TOOLCHAIN' if mx.is_linux() else 'mx:DEFAULT_NINJA_TOOLCHAIN'
         super().__init__(
             _suite,
             NativeLibraryLauncherProject.library_launcher_project_name(self.language_library_config),
-            'src',
-            [],
             _dependencies,
-            None,
-            _dir,
-            'executable',
             deliverable=self.language_library_config.language,
-            use_jdk_headers=True,
-            toolchain=toolchain,
             **kwargs
         )
-
-    def isJDKDependent(self):
-        # This must always be False, the compiled thin launchers need to work on both latest LTS JDK and jdk-latest
-        return False
 
     @staticmethod
     def library_launcher_project_name(language_library_config):
         return "org.graalvm.launcher.native." + language_library_config.language
 
-    @property
-    def cflags(self):
+    def launcher_config(self):
         _dist = get_final_graalvm_distribution()
         _exe_paths = _dist.find_source_location('dependency:' + NativeLibraryLauncherProject.library_launcher_project_name(self.language_library_config))
         _exe_dirs = {dirname(p) for p in _exe_paths}
-        _dynamic_cflags = [
-            ('/std:c++17' if mx.is_windows() else '-std=c++17'),
-            '-O3', # Note: no -g to save 0.2MB on Linux
-            '-DCP_SEP=' + os.pathsep,
-            '-DDIR_SEP=' + ('\\\\' if mx.is_windows() else '/'),
-            '-DGRAALVM_VERSION=' + _suite.release_version(),
-        ]
-        if not mx.is_windows():
-            _dynamic_cflags += ['-pthread']
-            _dynamic_cflags += ['-Werror=undef'] # fail on undefined macro used in preprocessor
-        if mx.is_linux():
-            _dynamic_cflags += ['-stdlib=libc++'] # to link libc++ statically, see ldlibs
-        if mx.is_darwin():
-            _dynamic_cflags += ['-ObjC++']
+        config = {
+            'GRAALVM_VERSION': _suite.release_version(),
+        }
 
-        def escaped_path(path):
-            if mx.is_windows():
-                return path.replace('\\', '\\\\')
-            else:
-                return path
-
-        def escaped_relpath(path):
+        def _relpath(path):
             relative = {relpath(path, start=_exe_dir) for _exe_dir in _exe_dirs}
             if len(relative) > 1:
                 mx.abort(f"If multiple launcher targets are specified they need to be in directories agreeing on all relative paths: {_exe_dirs} relative to {path} lead to {relative}")
-            return escaped_path(relative.pop())
+            return relative.pop()
 
         _graalvm_home = _get_graalvm_archive_path("")
 
@@ -2512,8 +2480,7 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
             _mp.extend(path for path in _truffle_cp.split(os.pathsep) if path and path not in _mp)
         _mp = [join(_dist.path_substitutions.substitute('<jdk_base>'), x) for x in _mp]
         # path from language launcher to jars
-        _mp = [escaped_relpath(x) for x in _mp]
-        _lp = []
+        _mp = [_relpath(x) for x in _mp]
 
         launcher_jars = self.language_library_config.jar_distributions
         assert len(launcher_jars) > 0, launcher_jars
@@ -2529,29 +2496,20 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
         if not main_module:
             mx.abort(f"The distribution with main class {main_class} among {launcher_jars} must have export: {main_module_export}")
 
-        _dynamic_cflags.append('-DLAUNCHER_MAIN_MODULE=' + main_module)
-        _dynamic_cflags.append('-DLAUNCHER_CLASS=' + self.language_library_config.main_class)
+        config['LAUNCHER_MAIN_MODULE'] = main_module
+        config['LAUNCHER_CLASS'] = self.language_library_config.main_class
         if _mp:
-            _dynamic_cflags.append('-DLAUNCHER_MODULE_PATH="{\\"' + '\\", \\"'.join(_mp) + '\\"}"')
-        if _lp:
-            _dynamic_cflags.append('-DLAUNCHER_LIBRARY_PATH="{\\"' + '\\", \\"'.join(_lp) + '\\"}"')
+            config['LAUNCHER_MODULE_PATH'] = _mp
 
         # path to libjvm
         if mx.is_windows():
             _libjvm_path = join(self.jre_base, 'bin', 'server', 'jvm.dll')
         else:
             _libjvm_path = join(self.jre_base, 'lib', 'server', mx.add_lib_suffix("libjvm"))
-        _libjvm_path = escaped_relpath(_libjvm_path)
-        _dynamic_cflags += [
-            '-DLIBJVM_RELPATH=' + _libjvm_path,
-        ]
+        config['LIBJVM_RELPATH'] = _relpath(_libjvm_path)
 
-        languages_dir = join(_graalvm_home, "languages")
-        tools_dir = join(_graalvm_home, "tools")
-        _dynamic_cflags += [
-            '-DLANGUAGES_DIR=' + escaped_relpath(languages_dir),
-            '-DTOOLS_DIR=' + escaped_relpath(tools_dir),
-        ]
+        config['LANGUAGES_DIR'] = _relpath(join(_graalvm_home, "languages"))
+        config['TOOLS_DIR'] = _relpath(join(_graalvm_home, "tools"))
 
         # path to libjli - only needed on osx for AWT
         if mx.is_darwin():
@@ -2559,10 +2517,7 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
             if mx_sdk_vm.base_jdk_version() < 17:
                 _libjli_path = join(_libjli_path, 'jli')
             _libjli_path = join(_libjli_path, mx.add_lib_suffix("libjli"))
-            _libjli_path = escaped_relpath(_libjli_path)
-            _dynamic_cflags += [
-                '-DLIBJLI_RELPATH=' + _libjli_path,
-            ]
+            config['LIBJLI_RELPATH'] = _relpath(_libjli_path)
 
         # path to native image language library - this is set even if the library is not built, as it may be built after the fact
         if self.jvm_launcher:
@@ -2570,46 +2525,16 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
             _lib_path = join(_graalvm_home, "languages", self.language_library_config.language, self.default_language_home_relative_libpath())
         else:
             _lib_path = _dist.find_single_source_location('dependency:' + GraalVmLibrary.project_name(self.language_library_config))
-        _dynamic_cflags += [
-            '-DLIBLANG_RELPATH=' + escaped_relpath(_lib_path)
-        ]
+        config['LIBLANG_RELPATH'] = _relpath(_lib_path)
 
         if len(self.language_library_config.option_vars) > 0:
-            _dynamic_cflags += ['-DLAUNCHER_OPTION_VARS="{\\"' + '\\", \\"'.join(self.language_library_config.option_vars) + '\\"}"']
+            config['LAUNCHER_OPTION_VARS'] = list(self.language_library_config.option_vars)
 
         default_vm_args = [arg for arg in [mx_subst.string_substitutions.substitute(arg) for arg in self.language_library_config.default_vm_args] if arg]
         if len(default_vm_args) > 0:
-            _dynamic_cflags += ['-DLAUNCHER_DEFAULT_VM_ARGS="{\\"' + '\\", \\"'.join(default_vm_args) + '\\"}"']
+            config['LAUNCHER_DEFAULT_VM_ARGS'] = default_vm_args
 
-        return super().cflags + _dynamic_cflags
-
-    @property
-    def ldflags(self):
-        _dynamic_ldflags = []
-        if not mx.is_windows():
-            _dynamic_ldflags += ['-pthread']
-        return super().ldflags + _dynamic_ldflags
-
-    @property
-    def ldlibs(self):
-        _dynamic_ldlibs = []
-        if mx.is_linux():
-            # Link libc++ statically
-            _dynamic_ldlibs += [
-                '-stdlib=libc++',
-                '-static-libstdc++', # it looks weird but this does link libc++ statically
-                '-l:libc++abi.a',
-            ]
-        if not mx.is_windows():
-            _dynamic_ldlibs += ['-ldl']
-            if mx.is_darwin():
-                _dynamic_ldlibs += ['-framework', 'Foundation']
-
-                default_min_version = {'amd64': '10.13', 'aarch64': '11.0'}[mx.get_arch()]
-                min_version = os.getenv('MACOSX_DEPLOYMENT_TARGET', default_min_version)
-                _dynamic_ldlibs += ['-mmacosx-version-min=' + min_version]
-
-        return super().ldlibs + _dynamic_ldlibs
+        return config
 
     def default_language_home_relative_libpath(self):
         name = self.language_library_config.language + "vm"

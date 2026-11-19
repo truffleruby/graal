@@ -52,11 +52,11 @@ from typing import Tuple
 
 import mx
 import mx_sdk
+import mx_sdk_thin_launcher
 import mx_sdk_vm
 import mx_sdk_vm_impl
 import mx_subst
 import mx_util
-import mx_native
 import mx_pomdistribution
 from mx import TimeStampFile
 
@@ -693,7 +693,7 @@ def _pop_list(kw_args, name, suite, dependency_name):
         mx.abort("Attribute '" + name + "' must be a list", context=f"'{dependency_name}' in '{suite.name}'")
     return v
 
-class ThinLauncherProject(mx_native.DefaultNativeProject):
+class ThinLauncherProject(mx_sdk_thin_launcher.RustLauncherProject):
     def __init__(self, suite, name, deps, workingSets, theLicense=None, **kw_args):
         self.relative_jre_path = _require_path(kw_args, 'relative_jre_path', suite, name)
         self.relative_module_path = _pop_path(kw_args, 'relative_module_path', None)
@@ -706,27 +706,17 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
         self.relative_extracted_lib_paths = {k: v.replace('/', os.sep) for k, v in kw_args.pop('relative_extracted_lib_paths', {}).items()}
         self.liblang_relpath = _pop_path(kw_args, 'relative_liblang_path', None)
         self.setup_relative_resources = kw_args.pop('setup_relative_resources', None)
-        self.windows_manifest = join(_suite.dir, 'src', 'org.graalvm.launcher.native', 'manifest', 'launcher.manifest')
 
-        if not kw_args.get('multitarget'):
-            # We use our LLVM toolchain on Linux by default because we want to statically link the C++ standard library,
-            # and the system toolchain rarely has libstdc++.a installed (it would be an extra CI & dev dependency).
-            toolchain = 'sdk:LLVM_NINJA_TOOLCHAIN' if mx.is_linux() else 'mx:DEFAULT_NINJA_TOOLCHAIN'
-        else:
-            toolchain = None
+        # The launcher is built with rustc for the host target only. A multitarget project keeps the layout of its
+        # results (in a <os>-<arch>/<libc> subdirectory), but the targets and toolchains it lists are not used.
+        multitarget = bool(kw_args.pop('multitarget', None))
 
         super().__init__(
             suite,
             name,
-            'src',
             [],
-            [],
-            None,
-            join(_suite.dir, "src", "org.graalvm.launcher.native"),
-            'executable',
-            # deliverable=None,
-            use_jdk_headers=True,
-            toolchain=toolchain,
+            multitarget=multitarget,
+            theLicense=theLicense,
             **kw_args
         )
         if len(self.jar_distributions) < 1:
@@ -741,48 +731,10 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
             self.buildDependencies.append(self.setup_relative_resources['components_from'])
         super().resolveDeps()
 
-    def isJDKDependent(self):
-        # This must always be False, the compiled thin launchers need to work on both latest LTS JDK and jdk-latest
-        return False
-
-    @property
-    def uses_llvm_toolchain(self):
-        return len(self.toolchains) == 1 and mx.dependency('LLVM_NINJA_TOOLCHAIN', fatalIfMissing=False) == self.toolchains[0].toolchain_dist
-
-    @property
-    def uses_musl_swcfi_toolchain(self):
-        # once GR-67435 is fixed we can revisit if we can statically link just like in the branches guarded by uses_llvm_toolchain
-        return len(self.toolchains) == 1 and mx.dependency('BOOTSTRAP_MUSL_SWCFI_NINJA_TOOLCHAIN', fatalIfMissing=False) == self.toolchains[0].toolchain_dist
-
-    @property
-    def cflags(self):
-        _dynamic_cflags = [
-            ('/std:c++17' if mx.is_windows() else '-std=c++17'),
-            '-O3', # Note: no -g to save 0.2MB on Linux
-            '-DCP_SEP=' + os.pathsep,
-            '-DDIR_SEP=' + ('\\\\' if mx.is_windows() else '/'),
-            f'-DGRAALVM_VERSION={get_bootstrap_graalvm_version()}',
-            ]
-        if not mx.is_windows():
-            _dynamic_cflags += ['-pthread']
-            _dynamic_cflags += ['-Werror=undef'] # fail on undefined macro used in preprocessor
-        if mx.is_linux() and self.uses_llvm_toolchain:
-            _dynamic_cflags += ['-stdlib=libc++'] # to link libc++ statically, see ldlibs
-        if mx.is_darwin():
-            _dynamic_cflags += ['-ObjC++']
-
-        def escaped_path(path):
-            if mx.is_windows():
-                return path.replace('\\', '\\\\')
-            else:
-                return path
-
-        _mp = []
-        _lp = []
-        if self.relative_module_path :
-            _mp.append(escaped_path(self.relative_module_path ))
-        if self.relative_library_path:
-            _lp.append(escaped_path(self.relative_library_path))
+    def launcher_config(self):
+        config = {
+            'GRAALVM_VERSION': str(get_bootstrap_graalvm_version()),
+        }
 
         main_class_package = self.main_class[0:self.main_class.rindex(".")]
         main_module_export = main_class_package + " to org.graalvm.launcher"
@@ -795,58 +747,38 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
         if not main_module:
             mx.abort(f"The distribution with main class {self.main_class} among {self.jar_distributions} must have export: {main_module_export}")
 
-        _dynamic_cflags.append('-DLAUNCHER_MAIN_MODULE=' + main_module)
-        _dynamic_cflags.append('-DLAUNCHER_CLASS=' + self.main_class)
-        if _mp:
-            _dynamic_cflags.append('-DLAUNCHER_MODULE_PATH="{\\"' + '\\", \\"'.join(_mp) + '\\"}"')
-        if _lp:
-            _dynamic_cflags.append('-DLAUNCHER_LIBRARY_PATH="{\\"' + '\\", \\"'.join(_lp) + '\\"}"')
+        config['LAUNCHER_MAIN_MODULE'] = main_module
+        config['LAUNCHER_CLASS'] = self.main_class
+        if self.relative_module_path:
+            config['LAUNCHER_MODULE_PATH'] = [self.relative_module_path]
+        if self.relative_library_path:
+            config['LAUNCHER_LIBRARY_PATH'] = [self.relative_library_path]
 
         # path to libjvm
         if mx.is_windows():
-            _libjvm_path = join(self.relative_jre_path, 'bin', 'server', 'jvm.dll')
+            config['LIBJVM_RELPATH'] = join(self.relative_jre_path, 'bin', 'server', 'jvm.dll')
         else:
-            _libjvm_path = join(self.relative_jre_path, 'lib', 'server', mx.add_lib_suffix("libjvm"))
-        _libjvm_path = escaped_path(_libjvm_path)
-        _dynamic_cflags += [
-            '-DLIBJVM_RELPATH=' + _libjvm_path,
-        ]
+            config['LIBJVM_RELPATH'] = join(self.relative_jre_path, 'lib', 'server', mx.add_lib_suffix("libjvm"))
 
         # path to libjli - only needed on osx for AWT
         if mx.is_darwin():
-            _libjli_path = join(self.relative_jre_path, 'lib', mx.add_lib_suffix("libjli"))
-            _libjli_path = escaped_path(_libjli_path)
-            _dynamic_cflags += [
-                '-DLIBJLI_RELPATH=' + _libjli_path,
-            ]
+            config['LIBJLI_RELPATH'] = join(self.relative_jre_path, 'lib', mx.add_lib_suffix("libjli"))
 
         if self.liblang_relpath:
-            _dynamic_cflags += [
-                '-DLIBLANG_RELPATH=' + escaped_path(self.liblang_relpath)
-            ]
+            config['LIBLANG_RELPATH'] = self.liblang_relpath
 
         if len(self.option_vars) > 0:
-            _dynamic_cflags += ['-DLAUNCHER_OPTION_VARS="{\\"' + '\\", \\"'.join(self.option_vars) + '\\"}"']
+            config['LAUNCHER_OPTION_VARS'] = list(self.option_vars)
 
-        # Set the cflags that inform the launcher of the various language home dirs.
+        # Inform the launcher of the various language home dirs.
         #
-        # Note that `lib_home_path` is relative to the directory containing the thin launcher.
-        lang_home_names = []
-        bin_home_paths = []
-        for lang_home_name, lib_home_path in self.relative_home_paths.items():
-            lang_home_names.append(lang_home_name)
-            bin_home_paths.append(escaped_path(lib_home_path))
-        if lang_home_names:
-            _dynamic_cflags += [
-                '-DLAUNCHER_LANG_HOME_NAMES="{\\"' + '\\", \\"'.join(lang_home_names) + '\\"}"',
-                '-DLAUNCHER_LANG_HOME_PATHS="{\\"' + '\\", \\"'.join(bin_home_paths) + '\\"}"',
-                ]
-        extracted_lib_names = []
-        extracted_lib_paths = []
-        for extracted_lib_name, extracted_lib_path in self.relative_extracted_lib_paths.items():
-            bin_lib_path = escaped_path(extracted_lib_path)
-            extracted_lib_names.append(extracted_lib_name)
-            extracted_lib_paths.append(bin_lib_path)
+        # Note that the paths are relative to the directory containing the thin launcher.
+        if self.relative_home_paths:
+            config['LAUNCHER_LANG_HOME_NAMES'] = list(self.relative_home_paths.keys())
+            config['LAUNCHER_LANG_HOME_PATHS'] = list(self.relative_home_paths.values())
+
+        extracted_lib_names = list(self.relative_extracted_lib_paths.keys())
+        extracted_lib_paths = list(self.relative_extracted_lib_paths.values())
 
         if self.setup_relative_resources:
             resources_project = mx.dependency(self.setup_relative_resources['components_from'])
@@ -860,52 +792,14 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
                 extracted_lib_paths.append(join(relative_root, component))
 
         if extracted_lib_names:
-            _dynamic_cflags += [
-                '-DLAUNCHER_EXTRACTED_LIB_NAMES="{\\"' + '\\", \\"'.join(extracted_lib_names) + '\\"}"',
-                '-DLAUNCHER_EXTRACTED_LIB_PATHS="{\\"' + '\\", \\"'.join(extracted_lib_paths) + '\\"}"',
-                ]
+            config['LAUNCHER_EXTRACTED_LIB_NAMES'] = extracted_lib_names
+            config['LAUNCHER_EXTRACTED_LIB_PATHS'] = extracted_lib_paths
 
         default_vm_args = [arg for arg in [mx_subst.string_substitutions.substitute(arg) for arg in self.default_vm_args] if arg]
         if len(default_vm_args) > 0:
-            _dynamic_cflags += ['-DLAUNCHER_DEFAULT_VM_ARGS="{\\"' + '\\", \\"'.join(default_vm_args) + '\\"}"']
+            config['LAUNCHER_DEFAULT_VM_ARGS'] = default_vm_args
 
-        return super().cflags + _dynamic_cflags
-
-    @property
-    def ldflags(self):
-        _dynamic_ldflags = []
-        if mx.is_windows():
-            _dynamic_ldflags += ['/MANIFEST:EMBED', '/MANIFESTINPUT:' + self.windows_manifest]
-        if not mx.is_windows():
-            _dynamic_ldflags += ['-pthread']
-        if self.uses_musl_swcfi_toolchain:
-            # Use $$ to escape the $ from expansion by mx. If we use musl swcfi
-            # and their libc, the libc++, libc++abi and libunwind must be
-            # either in the LD_LIBRARY_PATH (which takes precedence) or in the
-            # lib folder of the standalone.
-            _dynamic_ldflags.append(r"-Wl,-rpath,'$$ORIGIN/../lib'")
-        return super().ldflags + _dynamic_ldflags
-
-    @property
-    def ldlibs(self):
-        _dynamic_ldlibs = []
-        if mx.is_linux() and self.uses_llvm_toolchain:
-            # Link libc++ statically
-            _dynamic_ldlibs += [
-                '-stdlib=libc++',
-                '-static-libstdc++', # it looks weird but this does link libc++ statically
-                '-l:libc++abi.a',
-            ]
-        if not mx.is_windows():
-            _dynamic_ldlibs += ['-ldl']
-        if mx.is_darwin():
-            _dynamic_ldlibs += ['-framework', 'Foundation']
-
-            default_min_version = {'amd64': '10.13', 'aarch64': '11.0'}[mx.get_arch()]
-            min_version = os.getenv('MACOSX_DEPLOYMENT_TARGET', default_min_version)
-            _dynamic_ldlibs += ['-mmacosx-version-min=' + min_version]
-
-        return super().ldlibs + _dynamic_ldlibs
+        return config
 
 
 class JavaHomeDependency(mx.BaseLibrary):
