@@ -190,6 +190,10 @@ static bool found_switch_to_jvm_flag = false;
  * The launcher is short-lived, so strings which live until the VM is created are not freed.
  * ------------------------------------------------------------------------- */
 
+/* The x* functions below are used instead of malloc(), realloc(), strdup() and strndup():
+ * - they exit with an error message when out of memory, so callers do not need to check for NULL.
+ * - strndup() does not exist on Windows, and strdup() is only a deprecated alias of _strdup() there.
+ */
 static void *xmalloc(size_t size) {
     void *p = malloc(size == 0 ? 1 : size);
     if (p == NULL) {
