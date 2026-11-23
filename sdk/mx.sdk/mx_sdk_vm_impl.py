@@ -2443,9 +2443,6 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
         self.jvm_launcher = _skip_libraries(self.language_library_config) or not _get_svm_support().is_supported()
         _dependencies = [] if (self.jvm_launcher) else [GraalVmNativeImage.project_name(self.language_library_config)]
         self.jre_base = get_final_graalvm_distribution().path_substitutions.substitute('<jre_base>')
-        # The launcher is written in C and only needs the C standard library,
-        # so the system toolchain is enough on all platforms.
-        toolchain = 'mx:DEFAULT_NINJA_TOOLCHAIN'
         super().__init__(
             _suite,
             NativeLibraryLauncherProject.library_launcher_project_name(self.language_library_config),
@@ -2457,7 +2454,6 @@ class NativeLibraryLauncherProject(mx_native.DefaultNativeProject):
             'executable',
             deliverable=self.language_library_config.language,
             use_jdk_headers=True,
-            toolchain=toolchain,
             **kwargs
         )
 

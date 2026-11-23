@@ -708,13 +708,6 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
         self.setup_relative_resources = kw_args.pop('setup_relative_resources', None)
         self.windows_manifest = join(_suite.dir, 'src', 'org.graalvm.launcher.native', 'manifest', 'launcher.manifest')
 
-        if not kw_args.get('multitarget'):
-            # The launcher is written in C and only needs the C standard library,
-            # so the system toolchain is enough on all platforms.
-            toolchain = 'mx:DEFAULT_NINJA_TOOLCHAIN'
-        else:
-            toolchain = None
-
         super().__init__(
             suite,
             name,
@@ -726,7 +719,6 @@ class ThinLauncherProject(mx_native.DefaultNativeProject):
             'executable',
             # deliverable=None,
             use_jdk_headers=True,
-            toolchain=toolchain,
             **kw_args
         )
         if len(self.jar_distributions) < 1:

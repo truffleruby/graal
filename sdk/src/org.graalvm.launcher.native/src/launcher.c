@@ -40,9 +40,9 @@
  */
 
 
-#if defined (__linux__)
-    /* for pthread_getattr_np(), realpath(), setenv(), strdup(), ... */
-    #define _GNU_SOURCE
+// for pthread_getattr_np() on Linux
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
 
 #include <jni.h>
@@ -171,9 +171,9 @@
     #error platform not supported or undefined
 #endif
 
-/* jint JNI_CreateJavaVM(JavaVM **p_vm, void **p_env, void *vm_args); */
+// jint JNI_CreateJavaVM(JavaVM **p_vm, void **p_env, void *vm_args);
 typedef jint(*CreateJavaVM_type)(JavaVM **, void **, void *);
-/* jint JNI_GetDefaultJavaVMInitArgs(void *vm_args); */
+// jint JNI_GetDefaultJavaVMInitArgs(void *vm_args);
 typedef jint(*GetDefaultJavaVMInitArgs_type)(void *);
 
 extern char **environ;
@@ -358,7 +358,7 @@ static char *exe_path(void) {
 static char *exe_directory(void) {
     char *path = exe_path();
     #if defined (_WIN32)
-        /* get the directory part */
+        // get the directory part
         char drive[_MAX_DRIVE];
         char dir[_MAX_DIR];
         char result[_MAX_PATH];
@@ -521,8 +521,8 @@ enum ArgFileState {
     IN_TOKEN
 };
 
-/* Parse @arg-files as handled by libjli. See libjli/args.c.
- * Returns the next token (owned by the caller), or NULL if there are no more tokens. */
+// Parse @arg-files as handled by libjli. See libjli/args.c.
+// Returns the next token (owned by the caller), or NULL if there are no more tokens.
 static char *arg_file_next_token(FILE *input) {
     enum ArgFileState state = FIND_NEXT;
     int currentQuoteChar = -1;
@@ -532,7 +532,7 @@ static char *arg_file_next_token(FILE *input) {
     strbuf_init(&token);
 
     while ((ch = fgetc(input)) != EOF) {
-        /* Skip white space characters */
+        // Skip white space characters
         if (state == FIND_NEXT || state == SKIP_LEAD_WS) {
             while (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == '\f') {
                 if ((ch = fgetc(input)) == EOF) {
@@ -540,13 +540,13 @@ static char *arg_file_next_token(FILE *input) {
                 }
             }
             state = (state == FIND_NEXT) ? IN_TOKEN : IN_QUOTE;
-            /* Deal with escape sequences */
+            // Deal with escape sequences
         } else if (state == IN_ESCAPE) {
-            /* concatenation directive */
+            // concatenation directive
             if (ch == '\n' || ch == '\r') {
                 state = SKIP_LEAD_WS;
             } else {
-                /* escaped character */
+                // escaped character
                 switch (ch) {
                     case 'n':
                         strbuf_append_char(&token, '\n');
@@ -567,7 +567,7 @@ static char *arg_file_next_token(FILE *input) {
                 state = IN_QUOTE;
             }
             continue;
-            /* ignore comment to EOL */
+            // ignore comment to EOL
         } else if (state == IN_COMMENT) {
             while (ch != '\n' && ch != '\r') {
                 if ((ch = fgetc(input)) == EOF) {
@@ -591,7 +591,7 @@ static char *arg_file_next_token(FILE *input) {
                     strbuf_append_char(&token, (char) ch);
                     continue;
                 }
-                /* fallthrough */
+                // fallthrough
             case '\n':
             case '\r':
                 return token.data;
@@ -612,7 +612,7 @@ static char *arg_file_next_token(FILE *input) {
             case '\'':
             case '"':
                 if (state == IN_QUOTE && currentQuoteChar != ch) {
-                    /* not matching quote */
+                    // not matching quote
                     strbuf_append_char(&token, (char) ch);
                     continue;
                 }
@@ -692,7 +692,7 @@ static void parse_vm_options(struct MainThreadArgs *parsedArgs) {
     if (vmArgInfo != NULL) {
         relaunch = true;
         vmArgCount = (int) strtol(vmArgInfo, NULL, 10);
-        /* clear the env variable */
+        // clear the env variable
         launcher_setenv("GRAALVM_LANGUAGE_LAUNCHER_VMARGS", "");
     }
 
@@ -773,8 +773,8 @@ static void parse_vm_options(struct MainThreadArgs *parsedArgs) {
                 free(canonicalDir);
             }
             #else
-            /* From https://learn.microsoft.com/en-us/windows/win32/fileio/listing-the-files-in-a-directory
-             * and https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilea */
+            // From https://learn.microsoft.com/en-us/windows/win32/fileio/listing-the-files-in-a-directory
+            // and https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilea
             WIN32_FIND_DATAA entry;
             char *searchDir = concat3(absoluteDir, "\\*", "");
             HANDLE dir = FindFirstFileA(searchDir, &entry);
@@ -884,7 +884,7 @@ static void parse_vm_options(struct MainThreadArgs *parsedArgs) {
             if (debug) {
                 DEBUG_PRINTF("Launcher option_var found: %s=%s\n", launcherOptionVars[i], optionVar);
             }
-            /* we split on spaces */
+            // we split on spaces
             const char *last = optionVar;
             const char *next;
             char *option;
@@ -957,12 +957,12 @@ static int setstacksize(pthread_attr_t* attr, size_t stack_size);
 static void dummyTimer(CFRunLoopTimerRef timer, void *info) {}
 
 static void ParkEventLoop(void) {
-    /* RunLoop needs at least one source, and 1e20 is pretty far into the future */
+    // RunLoop needs at least one source, and 1e20 is pretty far into the future
     CFRunLoopTimerRef t = CFRunLoopTimerCreate(kCFAllocatorDefault, 1.0e20, 0.0, 0, 0, dummyTimer, NULL);
     CFRunLoopAddTimer(CFRunLoopGetCurrent(), t, kCFRunLoopDefaultMode);
     CFRelease(t);
 
-    /* Park this thread in the main run loop. */
+    // Park this thread in the main run loop.
     int32_t result;
     do {
         result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0e20, false);
@@ -1071,8 +1071,8 @@ int main(int argc, char *argv[]) {
             return -1;
         }
 
-        /* See: https://github.com/openjdk/jdk/blob/8c1b915c7ef2b3a6e65705b91f4eb464caaec4e7/src/java.base/unix/native/libjli/java_md.c#L685 */
-        pthread_attr_setguardsize(&attr, 0); /* no pthread guard page on java threads */
+        // See: https://github.com/openjdk/jdk/blob/8c1b915c7ef2b3a6e65705b91f4eb464caaec4e7/src/java.base/unix/native/libjli/java_md.c#L685
+        pthread_attr_setguardsize(&attr, 0); // no pthread guard page on java threads
 
         pthread_t main_thr;
         if (pthread_create(&main_thr, &attr, &jvm_main_thread_start, &parsedArgs) != 0) {
@@ -1106,7 +1106,7 @@ int main(int argc, char *argv[]) {
             return -1;
         }
 
-        /* join thread */
+        // join thread
         DWORD exitCode = 0;
         WaitForSingleObject((HANDLE)hThread, INFINITE);
         GetExitCodeThread((HANDLE)hThread, &exitCode);
@@ -1180,12 +1180,12 @@ static int jvm_main_thread(struct MainThreadArgs *parsedArgs) {
         bool jdk24_or_higher = getDefaultJavaVMInitArgs(&defaultArgs) == JNI_OK;
 
         if (jdk24_or_higher) {
-            /* GR-59703: Migrate sun.misc.* usages. */
+            // GR-59703: Migrate sun.misc.* usages.
             strlist_push(vmArgs, xstrdup("--sun-misc-unsafe-memory-access=allow"));
         }
     }
 
-    /* Convert vmArgs to JavaVMInitArgs */
+    // Convert vmArgs to JavaVMInitArgs
     jint nOptions = (jint) (jvmMode ? vmArgs->len : 1 + vmArgs->len);
     JavaVMOption *options = (JavaVMOption*) calloc(nOptions, sizeof(JavaVMOption));
     if (options == NULL) {
@@ -1314,7 +1314,7 @@ static int jvm_main_thread(struct MainThreadArgs *parsedArgs) {
                 DEBUG_PRINTF("Relaunch exception has been thrown\n");
             }
             (*env)->ExceptionClear(env);
-            /* read correct VM arguments from exception */
+            // read correct VM arguments from exception
             jobjectArray relaunchVmArgs = (jobjectArray)(*env)->GetObjectField(env, t, vmArgsFid);
             if ((*env)->ExceptionCheck(env)) {
                 jni_error(env, "Error in GetObjectField:");
@@ -1378,7 +1378,7 @@ static size_t parse_size(const char *str) {
         pos++;
     }
     if (pos == 0 || size - pos > 1) {
-        /* invalid */
+        // invalid
         return 0;
     }
     if (pos == size) {
@@ -1389,21 +1389,21 @@ static size_t parse_size(const char *str) {
         case 'T':
         case 't':
             multiplier *= 1024;
-            /* fallthrough */
+            // fallthrough
         case 'G':
         case 'g':
             multiplier *= 1024;
-            /* fallthrough */
+            // fallthrough
         case 'M':
         case 'm':
             multiplier *= 1024;
-            /* fallthrough */
+            // fallthrough
         case 'K':
         case 'k':
             multiplier *= 1024;
             break;
         default:
-            /* invalid */
+            // invalid
             return 0;
     }
     return n * multiplier;
@@ -1416,7 +1416,7 @@ static size_t round_to_pagesize(size_t stack_size) {
     if (remainder == 0) {
         return stack_size;
     } else {
-        /* Round up to the next full page */
+        // Round up to the next full page
         return stack_size - remainder + (stack_size <= SIZE_MAX - page_size ? page_size : 0);
     }
 }
@@ -1426,12 +1426,12 @@ static size_t round_to_pagesize(size_t stack_size) {
  */
 static int setstacksize(pthread_attr_t* attr, size_t stack_size) {
     int result = 0;
-    /* See: https://github.com/openjdk/jdk/blob/8c1b915c7ef2b3a6e65705b91f4eb464caaec4e7/src/java.base/unix/native/libjli/java_md.c#L675-L684 */
+    // See: https://github.com/openjdk/jdk/blob/8c1b915c7ef2b3a6e65705b91f4eb464caaec4e7/src/java.base/unix/native/libjli/java_md.c#L675-L684
     if (stack_size > 0) {
         result = pthread_attr_setstacksize(attr, stack_size);
         if (result == EINVAL) {
-            /* System may require stack size to be multiple of page size
-             * Retry with adjusted value */
+            // System may require stack size to be multiple of page size
+            // Retry with adjusted value
             size_t adjusted_stack_size = round_to_pagesize(stack_size);
             if (adjusted_stack_size != stack_size) {
                 result = pthread_attr_setstacksize(attr, adjusted_stack_size);
@@ -1464,7 +1464,7 @@ static size_t current_thread_stack_size(void) {
         pthread_attr_destroy(&attr);
     }
 #elif defined(_WIN32)
-    /* Windows 8+: GetCurrentThreadStackLimits(&low, &high); */
+    // Windows 8+: GetCurrentThreadStackLimits(&low, &high);
     MEMORY_BASIC_INFORMATION mbi;
     memset(&mbi, 0, sizeof(mbi));
     VirtualQuery(&mbi, &mbi, sizeof(mbi));
