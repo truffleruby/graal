@@ -1,0 +1,82 @@
+# Temporary workflow to build and smoke-test the thin launcher on Windows, macOS and Linux.
+# Not meant to be merged.
+name: Thin launcher
+
+on:
+  push:
+    branches:
+      - 'thin-launcher-in-c-ci'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JAVA_HOME: ${{ github.workspace }}/jdk
+  MX_PATH: ${{ github.workspace }}/mx
+  MX_PYTHON: 'python'
+  PYTHONIOENCODING: 'utf-8'
+
+jobs:
+  thin-launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-latest, ubuntu-22.04]
+    name: thin launcher on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7.0.1
+    - name: Determine mx version
+      shell: bash
+      run: echo "MX_VERSION=$(jq -r '.mx_version' common.json)" >> ${GITHUB_ENV}
+    - name: Checkout graalvm/mx
+      uses: actions/checkout@v7.0.1
+      with:
+        repository: graalvm/mx.git
+        ref: ${{ env.MX_VERSION }}
+        path: ${{ env.MX_PATH }}
+    - name: Set up Python
+      uses: actions/setup-python@v7.1.0
+      with:
+        python-version: '3.12'
+    - name: Fetch LabsJDK
+      shell: bash
+      run: |
+        mkdir jdk-dl
+        ${MX_PATH}/mx --java-home= fetch-jdk --jdk-id labsjdk-ce-latest --to jdk-dl --alias ${JAVA_HOME}
+    - name: Build the thin launchers (Windows)
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        call ${{ env.MX_PATH }}\mx.cmd -p wasm build --dependencies graalwasm_thin_launcher || exit /b 1
+        call ${{ env.MX_PATH }}\mx.cmd -p wasm build --targets GRAALWASM_JVM_STANDALONE || exit /b 1
+    - name: Build the thin launchers (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        ${MX_PATH}/mx -p wasm build --dependencies graalwasm_thin_launcher
+        ${MX_PATH}/mx -p wasm build --targets GRAALWASM_JVM_STANDALONE
+    - name: Show the launcher build commands
+      if: always()
+      shell: bash
+      run: |
+        find wasm/mxbuild -name build.ninja -path '*thin_launcher*' -print -exec cat {} \;
+    - name: Smoke test the launcher
+      shell: bash
+      run: |
+        set -x
+        launcher=$(find wasm/mxbuild -path '*GRAALWASM_JVM_STANDALONE/bin/wasm*' -type f | head -1)
+        test -n "$launcher"
+        ls -l "$launcher"
+        "$launcher" --version
+        VERBOSE_GRAALVM_LAUNCHERS=true "$launcher" --vm.Xss64m --vm.Dfoo=bar --version
+        printf -- '-Xmx512m # comment\n"-Dfoo.bar=a b"\n' > argfile
+        VERBOSE_GRAALVM_LAUNCHERS=true "$launcher" --vm.@argfile --version
+        # an invalid VM option must fail
+        if "$launcher" --vm.XX:Bogus --version; then exit 1; fi
+        # relaunch: a --vm. option which the launcher heuristic cannot see as such
+        VERBOSE_GRAALVM_LAUNCHERS=true "$launcher" --version -- --vm.Dbar=baz || true
